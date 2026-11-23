@@ -1,0 +1,146 @@
+name: Generate Level Packs
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_level:
+        description: 'Start Level (e.g. 1)'
+        required: true
+        default: '1'
+      end_level:
+        description: 'End Level (e.g. 100)'
+        required: true
+        default: '100'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Generate chunks in parallel on 4 separate machines
+  # ─────────────────────────────────────────────────────────────
+  generate_chunk:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]   # 16 machines running at the same time
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Calculate Chunk Range
+        id: range
+        run: |
+          START=${{ github.event.inputs.start_level }}
+          END=${{ github.event.inputs.end_level }}
+          TOTAL=$((END - START + 1))
+          CHUNK_SIZE=$(( (TOTAL + 15) / 16 ))   # ceiling division, splits into 16 equal parts
+
+          CHUNK_START=$((START + ${{ matrix.chunk }} * CHUNK_SIZE))
+          CHUNK_END=$((CHUNK_START + CHUNK_SIZE - 1))
+
+          # Clamp chunk end to the overall end level
+          if [ $CHUNK_END -gt $END ]; then
+            CHUNK_END=$END
+          fi
+
+          echo "chunk_start=$CHUNK_START" >> $GITHUB_OUTPUT
+          echo "chunk_end=$CHUNK_END"     >> $GITHUB_OUTPUT
+
+          # Mark chunks that are completely out of range so we skip them
+          if [ $CHUNK_START -gt $END ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Machine ${{ matrix.chunk }}: SKIPPED (out of range)"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Machine ${{ matrix.chunk }}: Levels $CHUNK_START → $CHUNK_END"
+          fi
+
+      - name: Generate Levels for this Chunk
+        run: |
+          if [ "${{ steps.range.outputs.skip }}" = "true" ]; then
+            echo "Chunk ${{ matrix.chunk }} is out of range — skipping generation."
+            mkdir -p generated_packs
+            echo "[]" > generated_packs/chunk_empty.json
+          else
+            dart run tool/generate_packs.dart ${{ steps.range.outputs.chunk_start }} ${{ steps.range.outputs.chunk_end }}
+          fi
+
+      - name: Upload Chunk as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}
+          path: generated_packs/
+          retention-days: 1   # Temporary, only needed until the merge job finishes
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Merge all 4 chunks and push to the public hosting repo
+  # ─────────────────────────────────────────────────────────────
+  merge_and_deploy:
+    runs-on: ubuntu-latest
+    needs: generate_chunk   # Only runs after ALL 4 generation jobs succeed
+
+    steps:
+      - name: Download all chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_chunks/
+
+      - name: Merge chunks into a single pack file
+        run: |
+          START=${{ github.event.inputs.start_level }}
+          PACK_NUMBER=$(( (START - 1) / 100 + 1 ))
+          OUTPUT_FILE="merged_pack/pack_${PACK_NUMBER}.json"
+          mkdir -p merged_pack
+
+          echo "Merging chunks into $OUTPUT_FILE..."
+
+          # Collect all individual JSON files from chunks, sorted by filename (level order)
+          # Each chunk file is named like chunk-0/pack_1.json, chunk-1/pack_1.json etc.
+          python3 - <<'EOF'
+          import json, glob, os, sys
+
+          all_levels = []
+          # Find all pack json files across all chunk directories
+          chunk_files = sorted(glob.glob("all_chunks/chunk-*/pack_*.json"))
+          print(f"Found {len(chunk_files)} chunk files: {chunk_files}")
+
+          for f in chunk_files:
+              with open(f) as fp:
+                  levels = json.load(fp)
+                  all_levels.extend(levels)
+                  print(f"  Loaded {len(levels)} levels from {f}")
+
+          # Sort by level id to guarantee correct order
+          all_levels.sort(key=lambda x: x['id'])
+          print(f"Total levels after merge: {len(all_levels)}")
+
+          pack_number = (all_levels[0]['id'] - 1) // 100 + 1
+          out_path = f"merged_pack/pack_{pack_number}.json"
+          with open(out_path, "w") as fp:
+              json.dump(all_levels, fp)
+          print(f"Saved merged pack to {out_path}")
+          EOF
+
+      - name: Push merged pack to Public Hosting Repository
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.LEVELS_REPO_TOKEN }}
+        with:
+          source-directory: 'merged_pack'
+          destination-github-username: ${{ secrets.DESTINATION_GITHUB_USERNAME || github.repository_owner }}
+          destination-repository-name: 'arrows-levels'
+          target-branch: 'main'
+          user-email: 'bot@arrows-game.com'
+          commit-message: 'Add generated level pack'
